@@ -1,12 +1,10 @@
 package com.android.bluetooth.sap;
 
-import android.hardware.radio.V1_0.ISap;
-import android.hardware.radio.V1_0.SapApduType;
-import android.hardware.radio.V1_0.SapTransferProtocol;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.util.ArrayList;
+import java.security.InvalidParameterException;
+import java.util.Arrays;
 import java.util.Hashtable;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -15,7 +13,8 @@ import org.android.btsap.SapApi;
 import org.android.btsap.SapApi.*;
 import com.google.protobuf.micro.*;
 
-import android.os.RemoteException;
+import android.os.Parcel;
+import android.os.Parcelable;
 import android.util.Log;
 
 /**
@@ -158,7 +157,7 @@ public class SapMessage {
     static AtomicInteger sNextSerial = new AtomicInteger(1);
 
     // Map<rilSerial, RequestType> - HashTable is synchronized
-    static Map<Integer, Integer> sOngoingRequests = new Hashtable<Integer, Integer>();
+    private static Map<Integer, Integer> sOngoingRequests = new Hashtable<Integer, Integer>();
     private boolean mSendToRil = false; // set to true for messages that needs to go to the RIL
     private boolean mClearRilQueue = false; /* set to true for messages that needs to cause the
                                               sOngoingRequests to be cleared. */
@@ -709,103 +708,139 @@ public class SapMessage {
         dataLength[3] = (byte)((length) & 0xff);
         out.writeRawBytes(dataLength);
     }
-
-    private ArrayList<Byte> primitiveArrayToContainerArrayList(byte[] arr) {
-        ArrayList<Byte> arrayList = new ArrayList<>(arr.length);
-        for (byte b : arr) {
-            arrayList.add(b);
-        }
-        return arrayList;
-    }
-
     /**
-     * Send the message by calling corresponding ISap api.
+     * Write this SAP message as a rild compatible protobuf message.
+     * Solicited Requests are formed as follows:
+     *  int type - the rild-bt type
+     *  int serial - an number incrementing for each message.
      */
-    public void send(ISap sapProxy) throws RemoteException, RuntimeException {
+    public void writeReqToStream(CodedOutputStreamMicro out) throws IOException {
+
         int rilSerial = sNextSerial.getAndIncrement();
-
-        Log.e(TAG, "callISapReq: called for mMsgType " + mMsgType + " rilSerial " + rilSerial);
-
-        /* Update the ongoing requests queue */
-        if (mClearRilQueue == true) {
-            resetPendingRilMessages();
-        }
-        // No need to synchronize this, as the HashList is already doing this.
-        sOngoingRequests.put(rilSerial, mMsgType);
+        SapApi.MsgHeader msg = new MsgHeader();
+        /* Common variables for all requests */
+        msg.setToken(rilSerial);
+        msg.setType(SapApi.REQUEST);
+        msg.setError(SapApi.RIL_E_UNUSED);
 
         switch(mMsgType) {
         case ID_CONNECT_REQ:
         {
-            sapProxy.connectReq(rilSerial, mMaxMsgSize);
+            SapApi.RIL_SIM_SAP_CONNECT_REQ reqMsg = new RIL_SIM_SAP_CONNECT_REQ();
+            reqMsg.setMaxMessageSize(mMaxMsgSize);
+            msg.setId(SapApi.RIL_SIM_SAP_CONNECT);
+            msg.setPayload(ByteStringMicro.copyFrom(reqMsg.toByteArray()));
+            writeLength(msg.getSerializedSize(), out);
+            msg.writeTo(out);
             break;
         }
         case ID_DISCONNECT_REQ:
         {
-            sapProxy.disconnectReq(rilSerial);
+            SapApi.RIL_SIM_SAP_DISCONNECT_REQ reqMsg = new RIL_SIM_SAP_DISCONNECT_REQ();
+            msg.setId(SapApi.RIL_SIM_SAP_DISCONNECT);
+            msg.setPayload(ByteStringMicro.copyFrom(reqMsg.toByteArray()));
+            writeLength(msg.getSerializedSize(), out);
+            msg.writeTo(out);
             break;
         }
         case ID_TRANSFER_APDU_REQ:
         {
-            int type;
-            ArrayList<Byte> command;
+            SapApi.RIL_SIM_SAP_APDU_REQ reqMsg = new RIL_SIM_SAP_APDU_REQ();
+            msg.setId(SapApi.RIL_SIM_SAP_APDU);
             if(mApdu != null) {
-                type = SapApduType.APDU;
-                command = primitiveArrayToContainerArrayList(mApdu);
+                reqMsg.setType(SapApi.RIL_SIM_SAP_APDU_REQ.RIL_TYPE_APDU);
+                reqMsg.setCommand(ByteStringMicro.copyFrom(mApdu));
             } else if (mApdu7816 != null) {
-                type = SapApduType.APDU7816;
-                command = primitiveArrayToContainerArrayList(mApdu7816);
+                reqMsg.setType(SapApi.RIL_SIM_SAP_APDU_REQ.RIL_TYPE_APDU7816);
+                reqMsg.setCommand(ByteStringMicro.copyFrom(mApdu7816));
             } else {
                 Log.e(TAG, "Missing Apdu parameter in TRANSFER_APDU_REQ");
                 throw new IllegalArgumentException();
             }
-            sapProxy.apduReq(rilSerial, type, command);
+            msg.setPayload(ByteStringMicro.copyFrom(reqMsg.toByteArray()));
+            writeLength(msg.getSerializedSize(), out);
+            msg.writeTo(out);
             break;
         }
         case ID_SET_TRANSPORT_PROTOCOL_REQ:
         {
-            int transportProtocol;
+            SapApi.RIL_SIM_SAP_SET_TRANSFER_PROTOCOL_REQ reqMsg =
+                                            new RIL_SIM_SAP_SET_TRANSFER_PROTOCOL_REQ();
+            msg.setId(SapApi.RIL_SIM_SAP_SET_TRANSFER_PROTOCOL);
+
             if(mTransportProtocol == TRANS_PROTO_T0) {
-                transportProtocol = SapTransferProtocol.T0;
+                reqMsg.setProtocol(SapApi.RIL_SIM_SAP_SET_TRANSFER_PROTOCOL_REQ.t0);
             } else if(mTransportProtocol == TRANS_PROTO_T1) {
-                transportProtocol = SapTransferProtocol.T1;
+                reqMsg.setProtocol(SapApi.RIL_SIM_SAP_SET_TRANSFER_PROTOCOL_REQ.t1);
             } else {
-                Log.e(TAG, "Missing or invalid TransportProtocol parameter in"
-                                + " SET_TRANSPORT_PROTOCOL_REQ: " + mTransportProtocol);
+                Log.e(TAG, "Missing or invalid TransportProtocol parameter in"+
+                           " SET_TRANSPORT_PROTOCOL_REQ: "+ mTransportProtocol );
                 throw new IllegalArgumentException();
             }
-            sapProxy.setTransferProtocolReq(rilSerial, transportProtocol);
+            msg.setPayload(ByteStringMicro.copyFrom(reqMsg.toByteArray()));
+            writeLength(msg.getSerializedSize(), out);
+            msg.writeTo(out);
             break;
         }
         case ID_TRANSFER_ATR_REQ:
         {
-            sapProxy.transferAtrReq(rilSerial);
+            SapApi.RIL_SIM_SAP_TRANSFER_ATR_REQ reqMsg = new RIL_SIM_SAP_TRANSFER_ATR_REQ();
+            msg.setId(SapApi.RIL_SIM_SAP_TRANSFER_ATR);
+            msg.setPayload(ByteStringMicro.copyFrom(reqMsg.toByteArray()));
+            writeLength(msg.getSerializedSize(), out);
+            msg.writeTo(out);
             break;
         }
         case ID_POWER_SIM_OFF_REQ:
         {
-            sapProxy.powerReq(rilSerial, false);
+            SapApi.RIL_SIM_SAP_POWER_REQ reqMsg = new RIL_SIM_SAP_POWER_REQ();
+            msg.setId(SapApi.RIL_SIM_SAP_POWER);
+            reqMsg.setState(false);
+            msg.setPayload(ByteStringMicro.copyFrom(reqMsg.toByteArray()));
+            writeLength(msg.getSerializedSize(), out);
+            msg.writeTo(out);
             break;
         }
         case ID_POWER_SIM_ON_REQ:
         {
-            sapProxy.powerReq(rilSerial, true);
+            SapApi.RIL_SIM_SAP_POWER_REQ reqMsg = new RIL_SIM_SAP_POWER_REQ();
+            msg.setId(SapApi.RIL_SIM_SAP_POWER);
+            reqMsg.setState(true);
+            msg.setPayload(ByteStringMicro.copyFrom(reqMsg.toByteArray()));
+            writeLength(msg.getSerializedSize(), out);
+            msg.writeTo(out);
             break;
         }
         case ID_RESET_SIM_REQ:
         {
-            sapProxy.resetSimReq(rilSerial);
+            SapApi.RIL_SIM_SAP_RESET_SIM_REQ reqMsg = new RIL_SIM_SAP_RESET_SIM_REQ();
+            msg.setId(SapApi.RIL_SIM_SAP_RESET_SIM);
+            msg.setPayload(ByteStringMicro.copyFrom(reqMsg.toByteArray()));
+            writeLength(msg.getSerializedSize(), out);
+            msg.writeTo(out);
             break;
         }
         case ID_TRANSFER_CARD_READER_STATUS_REQ:
         {
-            sapProxy.transferCardReaderStatusReq(rilSerial);
+            SapApi.RIL_SIM_SAP_TRANSFER_CARD_READER_STATUS_REQ reqMsg =
+                                    new RIL_SIM_SAP_TRANSFER_CARD_READER_STATUS_REQ();
+            msg.setId(SapApi.RIL_SIM_SAP_TRANSFER_CARD_READER_STATUS);
+            msg.setPayload(ByteStringMicro.copyFrom(reqMsg.toByteArray()));
+            writeLength(msg.getSerializedSize(), out);
+            msg.writeTo(out);
             break;
         }
         default:
             Log.e(TAG, "Unknown request type");
             throw new IllegalArgumentException();
         }
-        if (VERBOSE) Log.e(TAG, "callISapReq: done without exceptions");
+        /* Update the ongoing requests queue */
+        if(mClearRilQueue == true) {
+            resetPendingRilMessages();
+        }
+        // No need to synchronize this, as the HashList is already doing this.
+        sOngoingRequests.put(rilSerial, mMsgType);
+        out.flush();
     }
 
     public static SapMessage newInstance(MsgHeader msg) throws IOException {
